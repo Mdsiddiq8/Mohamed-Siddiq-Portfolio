@@ -1,0 +1,7 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "Install packages", "type": "shell", "command": "npm install", "problemMatcher": [] },
+    { "label": "Run portfolio (localhost:3000)", "type": "shell", "command": "npm run dev", "isBackground": true, "problemMatcher": [], "group": { "kind": "build", "isDefault": true } }
+  ]
+}
