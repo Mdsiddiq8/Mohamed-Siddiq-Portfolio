@@ -19,7 +19,6 @@ and every time you scroll back to it. Visitors on the internet still need one ta
 
 ## Optional
 - `NEXT_PUBLIC_ENTER_GATE=true` in `.env.local` shows an "Enter with sound" welcome screen (off by default).
-- `NEXT_PUBLIC_CHAT_API=http://localhost:8000` connects the chat widget to `chat-backend` (see its README).
 
 ## If it does not start
 - `node -v` must print v18 or higher.

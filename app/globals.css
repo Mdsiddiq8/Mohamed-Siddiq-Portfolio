@@ -40,13 +40,20 @@ body {
   background-size: 60px 60px;
 }
 
-/* Noise texture */
+/* Noise texture: a pre-baked tile instead of a live SVG feTurbulence filter.
+   feTurbulence is recomputed by the browser on every repaint of its element, and this
+   effect was duplicated across 4 full-height sections — on scroll that's 4 independent,
+   expensive fractal-noise shaders re-rasterizing in sync with the page compositing under
+   them, which is what made sections scroll like they were "hanging" on weaker devices.
+   A static decoded bitmap tile costs the GPU almost nothing to composite by comparison. */
 .noise-bg::before {
   content: '';
   position: absolute;
   inset: 0;
   opacity: 0.03;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-image: url("/images/noise.png");
+  background-repeat: repeat;
+  background-size: 128px 128px;
   pointer-events: none;
   z-index: 0;
 }
@@ -160,6 +167,24 @@ body {
   75% { transform: translateY(-2px) scale(1.004); }
 }
 .speaking-bob { animation: speak-bob 0.7s ease-in-out infinite; transform-origin: 50% 100%; }
+
+/* "Tap for sound" nudge */
+@keyframes sound-hint-pop {
+  0% { opacity: 0; transform: translate(-50%, 6px) scale(0.9); }
+  15% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+  85% { opacity: 1; transform: translate(-50%, 0) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, 0) scale(0.96); }
+}
+.sound-hint-pop { left: 50%; animation: sound-hint-pop 6s ease-in-out forwards; }
+@keyframes sound-hint-scale {
+  0%, 100% { transform: translateX(-50%) scale(1); }
+  50% { transform: translateX(-50%) scale(1.08); }
+}
+.sound-hint-scale { animation: sound-hint-scale 1s ease-in-out infinite, pulse-glow 2s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .sound-hint-pop, .sound-hint-scale { animation: none; opacity: 1; }
+}
 
 @keyframes wave {
   0%, 100% { height: 4px; }

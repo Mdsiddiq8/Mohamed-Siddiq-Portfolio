@@ -22,9 +22,41 @@ import {
   type Skill,
 } from "@/data/portfolio";
 import { brandIcons } from "@/data/skill-icons";
-import ChatWidget from "@/components/chat-widget";
 
 gsap.registerPlugin(ScrollTrigger);
+
+// Drives a draw loop off the video's own decoded frames (requestVideoFrameCallback,
+// supported on mobile Safari/Chrome) instead of the display's 60fps raf clock.
+// Uploading a video frame to the GPU twice for a single decoded frame is the main
+// cause of the hero stuttering on phones, since mobile video is ~24-30fps but raf
+// fires at 60fps; this halves that work on the devices that need it most. Desktop
+// Firefox (no rVFC support) falls back to a 30fps-capped raf loop.
+function scheduleVideoFrame(video: HTMLVideoElement, cb: () => void): () => void {
+  const withRvfc = video as HTMLVideoElement & {
+    requestVideoFrameCallback?: (c: () => void) => number;
+    cancelVideoFrameCallback?: (h: number) => void;
+  };
+  if (typeof withRvfc.requestVideoFrameCallback === "function") {
+    let handle = 0;
+    const loop = () => {
+      cb();
+      handle = withRvfc.requestVideoFrameCallback!(loop);
+    };
+    handle = withRvfc.requestVideoFrameCallback(loop);
+    return () => withRvfc.cancelVideoFrameCallback?.(handle);
+  }
+  let raf = 0;
+  let last = 0;
+  const loop = (t: number) => {
+    if (t - last >= 33) {
+      last = t;
+      cb();
+    }
+    raf = requestAnimationFrame(loop);
+  };
+  raf = requestAnimationFrame(loop);
+  return () => cancelAnimationFrame(raf);
+}
 
 /* ────────────────────────────────────────────
    NAVBAR
@@ -168,8 +200,10 @@ function TalkingPortrait() {
   const glRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [ready, setReady] = useState(false);
+  const [showSoundHint, setShowSoundHint] = useState(false);
   const speakingRef = useRef(false);
   const voicedRef = useRef(false);
+  const activeRef = useRef(true); // false while the portrait is scrolled off-screen: skips the heavy draw work so the page stays smooth on weaker devices
   speakingRef.current = speaking;
 
   useEffect(() => {
@@ -208,6 +242,34 @@ function TalkingPortrait() {
       setHasVideo(false);
       return;
     }
+    const coarse = window.matchMedia("(pointer: coarse)").matches;
+    // The canvas had a fixed 1280x720 backing buffer no matter how small it was actually
+    // drawn on screen, so a phone showing it at ~300px wide was still rasterizing a
+    // 1280x720 framebuffer every frame — up to 10x more pixels than ever hit the screen.
+    // Size the buffer to the real displayed size (capped dpr) instead.
+    const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1 : 2);
+    const fitCanvas = () => {
+      const r = cv.getBoundingClientRect();
+      const w = Math.max(1, Math.round(r.width * dpr));
+      const h = Math.max(1, Math.round(r.height * dpr));
+      if (cv.width !== w || cv.height !== h) {
+        cv.width = w;
+        cv.height = h;
+        gl.viewport(0, 0, w, h);
+      }
+    };
+    fitCanvas();
+    const ro = new ResizeObserver(fitCanvas);
+    ro.observe(cv);
+    // On phones, also shrink the frame before it reaches the GPU: texImage2D still has
+    // to upload the video at its full decoded resolution regardless of canvas size, and
+    // that upload bandwidth — not the draw call — is what was starving weaker GPUs.
+    const downscale = coarse ? document.createElement("canvas") : null;
+    const dctx = downscale?.getContext("2d", { alpha: false }) ?? null;
+    if (downscale) {
+      downscale.width = 640;
+      downscale.height = 360;
+    }
     const sh = (type: number, src: string) => {
       const o = gl.createShader(type)!;
       gl.shaderSource(o, src);
@@ -232,12 +294,16 @@ function TalkingPortrait() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    let raf = 0;
     let first = true;
     const render = () => {
-      if (video.readyState >= 2 && video.videoWidth > 0) {
+      if (activeRef.current && video.readyState >= 2 && video.videoWidth > 0) {
         try {
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+          let source: HTMLVideoElement | HTMLCanvasElement = video;
+          if (downscale && dctx) {
+            dctx.drawImage(video, 0, 0, downscale.width, downscale.height);
+            source = downscale;
+          }
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
           gl.clearColor(0, 0, 0, 0);
           gl.clear(gl.COLOR_BUFFER_BIT);
           gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -249,10 +315,12 @@ function TalkingPortrait() {
           /* ignore a dropped frame */
         }
       }
-      raf = requestAnimationFrame(render);
     };
-    raf = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(raf);
+    const stop = scheduleVideoFrame(video, render);
+    return () => {
+      stop();
+      ro.disconnect();
+    };
   }, [hasVideo]);
 
   // back to the silent loop
@@ -302,6 +370,7 @@ function TalkingPortrait() {
       if ((e.target as Element | null)?.closest?.("[data-intro-btn]")) return; // the button handles itself
       if (unlocked || voicedRef.current) return;
       unlocked = true;
+      setShowSoundHint(false);
       cleanup();
       startVoice();
     };
@@ -310,18 +379,32 @@ function TalkingPortrait() {
       window.removeEventListener("keydown", onGesture);
       window.removeEventListener("touchend", onGesture);
     };
+    let hintTimer: number | undefined;
     startVoice().then((ok) => {
       if (ok) {
         unlocked = true;
         cleanup();
+      } else {
+        // sound got blocked: make the "tap for sound" button obvious for a few seconds
+        hintTimer = window.setTimeout(() => setShowSoundHint(true), 600);
       }
     });
     window.addEventListener("pointerdown", onGesture);
     window.addEventListener("keydown", onGesture);
     window.addEventListener("touchend", onGesture);
-    return cleanup;
+    return () => {
+      window.clearTimeout(hintTimer);
+      cleanup();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasVideo]);
+
+  // auto-hide the hint after a while so it doesn't linger forever
+  useEffect(() => {
+    if (!showSoundHint) return;
+    const t = setTimeout(() => setShowSoundHint(false), 6000);
+    return () => clearTimeout(t);
+  }, [showSoundHint]);
 
   // leaving the video stops the voice, coming back speaks again (once sound has been unlocked)
   useEffect(() => {
@@ -329,6 +412,7 @@ function TalkingPortrait() {
     if (!hasVideo || !el) return;
     const io = new IntersectionObserver(
       ([e]) => {
+        activeRef.current = e.isIntersecting;
         if (!e.isIntersecting && speakingRef.current) stopVoice();
         else if (e.isIntersecting && voicedRef.current && !speakingRef.current) startVoice();
       },
@@ -343,14 +427,18 @@ function TalkingPortrait() {
   useEffect(() => {
     if (!hasVideo) return;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
     const g = canvas.getContext("2d");
     if (!g) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    let raf = 0;
+    const coarse = window.matchMedia("(pointer: coarse)").matches;
     let w = 0;
     let h = 0;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // phone GPUs push far fewer pixels/sec than desktops, so cap the backing
+    // buffer at 1x there instead of up to 2x — the ring/bars are decorative and
+    // don't need retina sharpness, and this is a big chunk of the frame cost
+    const dpr = Math.min(window.devicePixelRatio || 1, coarse ? 1 : 2);
     const resize = () => {
       const r = canvas.getBoundingClientRect();
       w = r.width;
@@ -370,7 +458,9 @@ function TalkingPortrait() {
     let level = 0;
     let lastBeat = 0;
 
-    const draw = (t: number) => {
+    const draw = () => {
+      if (!activeRef.current) return;
+      const t = performance.now();
       g.clearRect(0, 0, w, h);
       const cx = w * 0.472; // his centre line in the video
       const cy = h * 0.45; // upper chest, behind the chair
@@ -429,10 +519,9 @@ function TalkingPortrait() {
           const y1 = cy + Math.sin(ang) * (base + 10);
           const x2 = cx + Math.cos(ang) * (base + 10 + len);
           const y2 = cy + Math.sin(ang) * (base + 10 + len);
-          const lg = g.createLinearGradient(x1, y1, x2, y2);
-          lg.addColorStop(0, "rgba(0,85,255,0.9)");
-          lg.addColorStop(1, "rgba(34,211,238,0.85)");
-          g.strokeStyle = lg;
+          // a solid mid-tone instead of a per-bar gradient: avoids creating ~70 CanvasGradient
+          // objects every frame, which was heavy enough to stutter on weaker phones/laptops
+          g.strokeStyle = "rgba(17,148,246,0.88)";
           g.lineWidth = 3;
           g.lineCap = "round";
           g.beginPath();
@@ -441,16 +530,16 @@ function TalkingPortrait() {
           g.stroke();
         }
       }
-      raf = requestAnimationFrame(draw);
     };
-    raf = requestAnimationFrame(draw);
+    const stop = scheduleVideoFrame(video, draw);
     return () => {
-      cancelAnimationFrame(raf);
+      stop();
       ro.disconnect();
     };
   }, [hasVideo]);
 
   const toggle = async () => {
+    setShowSoundHint(false);
     const v = videoRef.current;
     if (hasVideo && v) {
       if (speakingRef.current && !v.muted) {
@@ -532,12 +621,30 @@ function TalkingPortrait() {
         />
       )}
 
+      {/* First-time nudge: makes it obvious the button below needs a tap before he's audible */}
+      {hasVideo && showSoundHint && !speaking && (
+        <div
+          role="status"
+          className="absolute left-1/2 -translate-x-1/2 -bottom-16 z-10 flex flex-col items-center sound-hint-pop"
+          aria-hidden
+        >
+          <span className="whitespace-nowrap rounded-full bg-[#0c111d] text-white text-xs font-semibold px-3.5 py-1.5 shadow-lg">
+            🔊 Tap to hear him speak
+          </span>
+          <svg width="14" height="8" viewBox="0 0 14 8" className="-mt-px" aria-hidden>
+            <path d="M0 0L7 8L14 0Z" fill="#0c111d" />
+          </svg>
+        </div>
+      )}
+
       {/* Play / speaking control */}
       <button
         data-intro-btn
         onClick={toggle}
         aria-label={speaking ? "Stop intro" : "Play intro with sound"}
-        className="absolute left-1/2 -translate-x-1/2 -bottom-4 z-10 flex items-center gap-3 px-5 py-3 rounded-full bg-[#0c111d]/90 text-white backdrop-blur-md hover:bg-[#0c111d] transition-colors pulse-glow"
+        className={`absolute left-1/2 -translate-x-1/2 -bottom-4 z-10 flex items-center gap-3 px-5 py-3 rounded-full bg-[#0c111d]/90 text-white backdrop-blur-md hover:bg-[#0c111d] transition-colors pulse-glow ${
+          showSoundHint && !speaking ? "sound-hint-scale" : ""
+        }`}
       >
         {speaking ? (
           <span className="flex items-end gap-[3px] h-4" aria-hidden>
@@ -750,7 +857,7 @@ function HeroSection() {
               AI Engineer<span className="text-[#0055ff]">.</span>
             </p>
             <div className="mt-4 flex flex-wrap items-center gap-2.5">
-              {["GenAI Engineer", "Prompt Engineer"].map((r, k) => (
+              {["GenAI Engineer"].map((r, k) => (
                 <span
                   key={r}
                   className="inline-flex items-center gap-2 rounded-full border border-[#0055ff]/15 bg-white/80 backdrop-blur px-4 py-1.5 text-[13px] font-semibold text-[#0c111d] shadow-[0_6px_18px_-10px_rgba(0,85,255,.45)]"
@@ -1747,7 +1854,6 @@ export default function GlassHero() {
       <ExperienceSection />
       <ServicesSection />
       <Footer />
-      <ChatWidget />
     </main>
   );
 }
